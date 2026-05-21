@@ -3,6 +3,7 @@ import "dotenv/config";
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   createDatabase,
   createKVNamespace,
@@ -65,6 +66,9 @@ const setupConfigFile = (examplePath: string, targetPath: string) => {
         case "wrangler.cleanup.json":
           json.name = `${PROJECT_NAME}-cleanup-worker`;
           break;
+        case "wrangler.dns.json":
+          json.name = `${PROJECT_NAME}-dns-worker`;
+          break;
         default:
           break;
       }
@@ -94,6 +98,7 @@ const setupWranglerConfigs = () => {
     { example: "wrangler.example.json", target: "wrangler.json" },
     { example: "wrangler.email.example.json", target: "wrangler.email.json" },
     { example: "wrangler.cleanup.example.json", target: "wrangler.cleanup.json" },
+    { example: "wrangler.dns.example.json", target: "wrangler.dns.json" },
   ];
 
   // 处理每个配置文件
@@ -283,7 +288,10 @@ const pushPagesSecret = () => {
     'AUTH_GITHUB_SECRET', 
     'AUTH_GOOGLE_ID', 
     'AUTH_GOOGLE_SECRET', 
-    'AUTH_SECRET'
+    'AUTH_SECRET',
+    'CLOUDFLARE_API_TOKEN',
+    'DNS_WORKER_URL',
+    'DNS_WORKER_SECRET',
   ];
 
   try {
@@ -407,6 +415,77 @@ const deployCleanupWorker = () => {
 };
 
 /**
+ * 部署DNS Worker
+ */
+const deployDnsWorker = () => {
+  console.log("🚧 Deploying DNS Worker...");
+  try {
+    // Auto-generate DNS_WORKER_SECRET if not set
+    if (!process.env.DNS_WORKER_SECRET) {
+      const secret = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
+      process.env.DNS_WORKER_SECRET = secret;
+      console.log("🔑 Generated DNS_WORKER_SECRET");
+    }
+
+    // Deploy first to create the worker
+    const output = execSync("pnpm dlx wrangler deploy --config wrangler.dns.json", { encoding: "utf-8" });
+    console.log(output);
+
+    // Set secrets for DNS worker
+    const secrets: Record<string, string> = {};
+    if (process.env.CLOUDFLARE_API_TOKEN) {
+      secrets.CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+    }
+    if (process.env.DNS_WORKER_SECRET) {
+      secrets.DNS_WORKER_SECRET = process.env.DNS_WORKER_SECRET;
+    }
+    // Email Worker name for catch-all rule routing
+    const emailWorkerName = `${PROJECT_NAME}-email-receiver-worker`;
+    secrets.EMAIL_WORKER_NAME = emailWorkerName;
+    console.log(`📧 Email Worker name for routing: ${emailWorkerName}`);
+
+    if (Object.keys(secrets).length > 0) {
+      const tmpFile = resolve(".dns-worker-secrets.json");
+      writeFileSync(tmpFile, JSON.stringify(secrets));
+      try {
+        execSync(`pnpm dlx wrangler secret bulk ${tmpFile} --config wrangler.dns.json`, { stdio: "inherit" });
+      } finally {
+        if (existsSync(tmpFile)) {
+          execSync(`rm ${tmpFile}`, { stdio: "inherit" });
+        }
+      }
+    }
+
+    // Extract worker URL from deploy output
+    const urlMatch = output.match(/https:\/\/[\w-]+\.[\w-]+\.workers\.dev/);
+    if (urlMatch) {
+      const workerUrl = urlMatch[0];
+      process.env.DNS_WORKER_URL = workerUrl;
+      console.log(`📌 DNS Worker URL: ${workerUrl}`);
+    } else if (!process.env.DNS_WORKER_URL) {
+      // Construct URL from project name
+      const projectName = process.env.PROJECT_NAME || "moemail";
+      const workerUrl = `https://${projectName}-dns-worker.${process.env.CLOUDFLARE_ACCOUNT_ID?.substring(0,8) || "unknown"}.workers.dev`;
+      process.env.DNS_WORKER_URL = workerUrl;
+      console.log(`⚠️ Could not extract URL from output, using: ${workerUrl}`);
+    }
+
+    // Write to .env so pushPagesSecret can read them
+    if (process.env.DNS_WORKER_URL) {
+      updateEnvVar("DNS_WORKER_URL", process.env.DNS_WORKER_URL);
+    }
+    if (process.env.DNS_WORKER_SECRET) {
+      updateEnvVar("DNS_WORKER_SECRET", process.env.DNS_WORKER_SECRET);
+    }
+
+    console.log("✅ DNS Worker deployed successfully");
+  } catch (error) {
+    console.error("❌ DNS Worker deployment failed:", error);
+    // 继续执行而不中断
+  }
+};
+
+/**
  * 创建或更新环境变量文件
  */
 const setupEnvFile = () => {
@@ -483,6 +562,7 @@ const main = async () => {
     migrateDatabase();
     await checkAndCreateKVNamespace();
     await checkAndCreatePages();
+    deployDnsWorker();
     pushPagesSecret();
     deployPages();
     deployEmailWorker();

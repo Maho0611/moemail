@@ -5,6 +5,9 @@ declare global {
   interface CloudflareEnv {
     DB: D1Database;
     SITE_CONFIG: KVNamespace;
+    CLOUDFLARE_API_TOKEN: string;
+    DNS_WORKER_URL: string;
+    DNS_WORKER_SECRET: string;
   }
 
   interface Window {
