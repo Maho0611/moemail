@@ -22,6 +22,7 @@ const CF_EMAIL_MX_SERVERS = [
 ]
 
 const CF_EMAIL_SPF_RECORD = "v=spf1 include:_spf.mx.cloudflare.net ~all"
+const CF_EMAIL_MX_RECORD_CONTENTS = new Set(CF_EMAIL_MX_SERVERS.map((mx) => mx.content))
 const MAX_DNS_LABEL_LENGTH = 63
 const MAX_DOMAIN_LENGTH = 253
 const MAX_SUBDOMAIN_PREFIX_LEVELS = 5
@@ -38,6 +39,13 @@ interface DnsDeleteResult {
   id: string
   success: boolean
   error?: string
+}
+
+interface DnsRecord {
+  id: string
+  type: string
+  name: string
+  content: string
 }
 
 type SubdomainValidationResult =
@@ -225,6 +233,38 @@ async function deleteDnsRecords(
   return results
 }
 
+function isProvisionedEmailDnsRecord(record: DnsRecord, domainName: string): boolean {
+  if (normalizeDomainName(record.name) !== normalizeDomainName(domainName)) {
+    return false
+  }
+
+  if (record.type === "MX") {
+    return CF_EMAIL_MX_RECORD_CONTENTS.has(record.content)
+  }
+
+  return record.type === "TXT" && record.content === CF_EMAIL_SPF_RECORD
+}
+
+async function findProvisionedEmailDnsRecordIds(
+  zoneId: string,
+  apiToken: string,
+  domainName: string
+): Promise<string[]> {
+  const normalizedDomainName = normalizeDomainName(domainName)
+  if (!normalizedDomainName) {
+    return []
+  }
+
+  const data = await cfFetch<DnsRecord[]>(
+    `/zones/${zoneId}/dns_records?name=${encodeURIComponent(normalizedDomainName)}&per_page=100`,
+    apiToken
+  )
+
+  return data.result
+    .filter((record) => isProvisionedEmailDnsRecord(record, normalizedDomainName))
+    .map((record) => record.id)
+}
+
 // ---- Handlers ----
 
 async function handleProvision(body: any, apiToken: string, emailWorkerName?: string): Promise<Response> {
@@ -332,16 +372,38 @@ async function handleProvision(body: any, apiToken: string, emailWorkerName?: st
 }
 
 async function handleDeprovision(body: any, apiToken: string): Promise<Response> {
-  const { zoneId, recordIds } = body
+  const { zoneId, recordIds, domain } = body
   if (typeof zoneId !== "string" || !zoneId.trim() || !recordIds || !Array.isArray(recordIds)) {
     return Response.json({ error: "Missing zoneId or recordIds" }, { status: 400 })
   }
   const normalizedZoneId = zoneId.trim()
 
   const results = await deleteDnsRecords(normalizedZoneId, apiToken, recordIds)
+  const directSuccess = results.every((r) => r.success)
 
-  const allSuccess = results.every((r) => r.success)
-  return Response.json({ success: allSuccess, results })
+  if (!directSuccess && typeof domain === "string" && domain.trim()) {
+    try {
+      const fallbackRecordIds = await findProvisionedEmailDnsRecordIds(normalizedZoneId, apiToken, domain)
+      const fallbackResults = await deleteDnsRecords(normalizedZoneId, apiToken, fallbackRecordIds)
+      const fallbackSuccess = fallbackRecordIds.length > 0 && fallbackResults.every((r) => r.success)
+
+      return Response.json({
+        success: fallbackSuccess,
+        results,
+        fallbackRecordIds,
+        fallbackResults,
+        error: fallbackSuccess ? undefined : "DNS cleanup fallback failed",
+      })
+    } catch (error) {
+      return Response.json({
+        success: false,
+        results,
+        error: error instanceof Error ? error.message : String(error),
+      }, { status: 502 })
+    }
+  }
+
+  return Response.json({ success: directSuccess, results })
 }
 
 async function handleFindZone(body: any, apiToken: string): Promise<Response> {

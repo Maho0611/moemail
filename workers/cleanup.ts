@@ -123,14 +123,15 @@ async function deleteExpiredEmailsForDomain(env: Env, domainName: string, now: n
 
 async function deprovisionDomainDns(env: Env, domain: DomainRow, recordIds: string[]) {
   if (recordIds.length === 0) {
-    return
+    throw new Error(`No DNS record IDs stored for ${domain.name}`)
   }
 
   if (!env.DNS_WORKER_URL || !env.DNS_WORKER_SECRET) {
     throw new Error("DNS Worker is not configured")
   }
 
-  const response = await fetch(`${env.DNS_WORKER_URL}/deprovision`, {
+  const dnsWorkerUrl = env.DNS_WORKER_URL.replace(/\/$/, "")
+  const response = await fetch(`${dnsWorkerUrl}/deprovision`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -139,12 +140,14 @@ async function deprovisionDomainDns(env: Env, domain: DomainRow, recordIds: stri
     body: JSON.stringify({
       zoneId: domain.zoneId,
       recordIds,
+      domain: domain.name,
     }),
   })
 
   const result = await response.json().catch(() => null) as { success?: boolean; error?: string } | null
   if (!response.ok || !result?.success) {
-    throw new Error(result?.error || `DNS cleanup failed with status ${response.status}`)
+    const details = result ? `: ${JSON.stringify(result).slice(0, 500)}` : ""
+    throw new Error(result?.error || `DNS cleanup failed with status ${response.status}${details}`)
   }
 }
 
